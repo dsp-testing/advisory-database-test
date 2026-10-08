@@ -1,0 +1,232 @@
+# Enables GitHub auto-merge on low-risk Dependabot PRs so that a single human approval is all that's needed;
+# GitHub merges once required reviews and status checks pass. This workflow never approves PRs.
+# The approved bot token must be configured as a Dependabot secret so the resulting push triggers post-merge CI.
+# Before setting DEPENDABOT_AUTO_MERGE_POST_MERGE_CI_VALIDATED=true, administrators must verify with a canary merge
+# that advisory-db-ci.yml runs on the merge commit and produces every build required by config/moda/deployment.yaml.
+# DEPENDABOT_AUTO_MERGE_BOT_LOGIN must contain the approved bot account's login.
+# Requires the repository setting "Allow auto-merge" (Settings > General > Pull Requests).
+# Pattern: https://docs.github.com/code-security/dependabot/working-with-dependabot/automating-dependabot-with-github-actions
+name: Dependabot auto-merge
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize]
+
+permissions: {}
+
+concurrency:
+  group: dependabot-auto-merge-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  auto-merge:
+    name: Enable auto-merge for low-risk updates
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    if: github.event.pull_request.user.login == 'dependabot[bot]' && github.actor == 'dependabot[bot]' && github.repository == 'dsp-testing/advisory-database-test'
+    env:
+      GH_TOKEN: ${{ secrets.INTERNAL_ACTIONS_DX_BOT_ACCOUNT_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+      PR_URL: ${{ github.event.pull_request.html_url }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+      LABEL: auto-merge-eligible
+      APPROVED_BOT_LOGIN: ${{ vars.DEPENDABOT_AUTO_MERGE_BOT_LOGIN }}
+      POST_MERGE_CI_VALIDATED: ${{ vars.DEPENDABOT_AUTO_MERGE_POST_MERGE_CI_VALIDATED }}
+    steps:
+      - name: Verify approved merge token
+        run: |
+          set -euo pipefail
+
+          if [[ "$POST_MERGE_CI_VALIDATED" != "true" ]]; then
+            echo "::error title=Post-merge CI is not validated::An administrator must confirm that an eligible canary merge triggers advisory-db-ci.yml and produces the advisory-db, Docker image, Docker security, and Moda config-bundle builds, then set DEPENDABOT_AUTO_MERGE_POST_MERGE_CI_VALIDATED=true."
+            exit 1
+          fi
+          if [[ -z "$APPROVED_BOT_LOGIN" ]]; then
+            echo "::error title=Approved bot login is not configured::Set DEPENDABOT_AUTO_MERGE_BOT_LOGIN to the login of the account approved to enable auto-merge."
+            exit 1
+          fi
+
+          token_login="$(gh api user --jq '.login')"
+          if [[ "$token_login" == "github-actions[bot]" ]]; then
+            echo "::error title=Invalid merge token::GITHUB_TOKEN cannot be used because merges it performs do not trigger the required push workflow."
+            exit 1
+          fi
+          if [[ "$token_login" != "$APPROVED_BOT_LOGIN" ]]; then
+            echo "::error title=Unexpected merge token identity::Expected '$APPROVED_BOT_LOGIN', authenticated as '$token_login'."
+            exit 1
+          fi
+          if [[ "$(gh api "repos/$GH_REPO" --jq '.permissions.push // false')" != "true" ]]; then
+            echo "::error title=Merge token lacks push access::The approved bot token must have push access to $GH_REPO."
+            exit 1
+          fi
+
+          echo "Validated approved merge token for '$token_login'."
+
+      - name: Fetch Dependabot metadata
+        id: metadata
+        uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3.1.0
+        with:
+          github-token: ${{ secrets.INTERNAL_ACTIONS_DX_BOT_ACCOUNT_TOKEN }}
+
+      - name: Evaluate eligibility
+        id: eligibility
+        env:
+          UPDATE_TYPE: ${{ steps.metadata.outputs.update-type }}
+          DEPENDENCY_GROUP: ${{ steps.metadata.outputs.dependency-group }}
+          UPDATED_DEPENDENCIES_JSON: ${{ steps.metadata.outputs.updated-dependencies-json }}
+        run: |
+          set -euo pipefail
+
+          # Groups whose updates we already treat as "merge with passing tests". Keep in sync with .github/dependabot.yml.
+          eligible_groups=(
+            bundler-low-regression
+            bundler-dev
+            bundler-patch-minor
+            bundler-security-updates
+            npm-low-regression
+            npm-patch-minor
+            npm-security-updates
+            all-github-actions
+          )
+
+          # Dependencies that must always get a deliberate, manual merge, even inside an otherwise eligible group.
+          # Patterns are deliberately narrow so GitHub Actions names (e.g. actions/checkout, github/codeql-action) don't match.
+          is_denylisted() {
+            case "$1" in
+              rails|railties|@rails/*) return 0 ;;
+              actioncable|actionmailbox|actionmailer|actionpack|actiontext|actionview) return 0 ;;
+              activejob|activemodel|activerecord|activestorage|activesupport) return 0 ;;
+              primer*|@primer/*|@github/*|github-*) return 0 ;;
+              failbot|hydro-client|feature-flags-client|chatops-controller|monolith-twirp-features-core) return 0 ;;
+              resque*|puma) return 0 ;;
+              *) return 1 ;;
+            esac
+          }
+
+          reasons=()
+
+          if [[ -z "$DEPENDENCY_GROUP" ]]; then
+            reasons+=("not part of a dependency group (individual PRs are reviewed and merged manually)")
+          else
+            group_ok=false
+            for g in "${eligible_groups[@]}"; do
+              if [[ "$DEPENDENCY_GROUP" == "$g" ]]; then
+                group_ok=true
+                break
+              fi
+            done
+            if [[ "$group_ok" != true ]]; then
+              reasons+=("group '$DEPENDENCY_GROUP' is not auto-merge eligible")
+            fi
+          fi
+
+          case "$UPDATE_TYPE" in
+            version-update:semver-patch|version-update:semver-minor) ;;
+            *) reasons+=("highest update type is '${UPDATE_TYPE:-unknown}' (only patch/minor are eligible)") ;;
+          esac
+
+          # update-type above ignores dependencies whose update type couldn't be determined, so check every entry.
+          if ! jq -e 'type == "array" and length > 0' <<<"${UPDATED_DEPENDENCIES_JSON:-null}" >/dev/null 2>&1; then
+            reasons+=("could not read the list of updated dependencies")
+          else
+            while IFS=$'\t' read -r name dep_update_type; do
+              case "$dep_update_type" in
+                version-update:semver-patch|version-update:semver-minor) ;;
+                *) reasons+=("'$name' has update type '${dep_update_type:-unknown}'") ;;
+              esac
+              if is_denylisted "$name"; then
+                reasons+=("'$name' always requires a manual merge")
+              fi
+            done < <(jq -r '.[] | [.dependencyName, (.updateType // "")] | @tsv' <<<"$UPDATED_DEPENDENCIES_JSON")
+          fi
+
+          if (( ${#reasons[@]} == 0 )); then
+            echo "eligible=true" >>"$GITHUB_OUTPUT"
+            echo "PR is eligible for auto-merge (group: $DEPENDENCY_GROUP, update type: $UPDATE_TYPE)."
+          else
+            echo "eligible=false" >>"$GITHUB_OUTPUT"
+            echo "PR is not eligible for auto-merge:"
+            printf '  - %s\n' "${reasons[@]}"
+          fi
+
+      - name: Ensure label exists
+        if: steps.eligibility.outputs.eligible == 'true'
+        run: |
+          set -euo pipefail
+          if gh api "repos/$GH_REPO/labels/$LABEL" --silent 2>/dev/null; then
+            echo "Label '$LABEL' already exists."
+          elif ! gh label create "$LABEL" --color 0e8a16 \
+            --description "Low-risk Dependabot update; merges automatically once approved and checks pass"; then
+            # Another run may have created it concurrently.
+            gh api "repos/$GH_REPO/labels/$LABEL" --silent
+          fi
+
+      - name: Label PR
+        if: steps.eligibility.outputs.eligible == 'true'
+        run: gh api --method POST "repos/$GH_REPO/issues/$PR_NUMBER/labels" -f "labels[]=$LABEL" --silent
+
+      - name: Enable auto-merge
+        if: steps.eligibility.outputs.eligible == 'true'
+        run: |
+          set -euo pipefail
+          owner="${GH_REPO%%/*}"
+          repo="${GH_REPO#*/}"
+          # $owner/$name below are GraphQL variables, not shell variables.
+          # shellcheck disable=SC2016
+          allowed="$(gh api graphql -F owner="$owner" -F name="$repo" \
+            -f query='query($owner: String!, $name: String!) { repository(owner: $owner, name: $name) { autoMergeAllowed } }' \
+            --jq '.data.repository.autoMergeAllowed')"
+          if [[ "$allowed" != "true" ]]; then
+            echo "::notice title=Auto-merge not enabled for this repository::An admin must enable 'Allow auto-merge' (Settings > General > Pull Requests). This PR is labeled '$LABEL' but must be merged manually until then."
+            exit 0
+          fi
+          gh pr merge --auto --merge "$PR_URL"
+          echo "Auto-merge enabled. GitHub will merge (merge commit) once a human approves and required checks pass."
+
+      - name: Withdraw auto-merge if no longer eligible
+        if: steps.eligibility.outputs.eligible == 'false'
+        env:
+          AUTO_MERGE_ENABLED: ${{ github.event.pull_request.auto_merge != null }}
+          HAS_LABEL: ${{ contains(github.event.pull_request.labels.*.name, 'auto-merge-eligible') }}
+        run: |
+          set -euo pipefail
+          if [[ "$AUTO_MERGE_ENABLED" == "true" ]]; then
+            gh pr merge --disable-auto "$PR_URL"
+            echo "Disabled auto-merge."
+          fi
+          if [[ "$HAS_LABEL" == "true" ]]; then
+            gh api --method DELETE "repos/$GH_REPO/issues/$PR_NUMBER/labels/$LABEL" --silent
+            echo "Removed label '$LABEL'."
+          fi
+
+  invalidate-auto-merge:
+    name: Disable auto-merge after a non-Dependabot update
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    if: >-
+      github.event.action == 'synchronize' &&
+      github.event.pull_request.user.login == 'dependabot[bot]' &&
+      github.actor != 'dependabot[bot]' &&
+      github.repository == 'dsp-testing/advisory-database-test'
+    permissions:
+      pull-requests: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+      PR_URL: ${{ github.event.pull_request.html_url }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+      LABEL: auto-merge-eligible
+      AUTO_MERGE_ENABLED: ${{ github.event.pull_request.auto_merge != null }}
+      HAS_LABEL: ${{ contains(github.event.pull_request.labels.*.name, 'auto-merge-eligible') }}
+    steps:
+      - name: Invalidate auto-merge eligibility
+        run: |
+          set -euo pipefail
+          if [[ "$AUTO_MERGE_ENABLED" == "true" ]]; then
+            gh pr merge --disable-auto "$PR_URL"
+            echo "Disabled auto-merge after a non-Dependabot push."
+          fi
+          if [[ "$HAS_LABEL" == "true" ]]; then
+            gh api --method DELETE "repos/$GH_REPO/issues/$PR_NUMBER/labels/$LABEL" --silent
+            echo "Removed label '$LABEL'."
+          fi

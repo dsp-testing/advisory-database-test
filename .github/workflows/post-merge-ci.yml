@@ -1,0 +1,23 @@
+name: Post-merge CI test
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  post-merge-build:
+    name: Post-merge build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Show trigger information
+        run: |
+          echo "Event: $GITHUB_EVENT_NAME"
+          echo "Actor: $GITHUB_ACTOR"
+          echo "Commit: $GITHUB_SHA"
+
+      - name: Simulate deployment build
+        run: echo "Post-merge deployment build completed"
